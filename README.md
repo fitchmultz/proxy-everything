@@ -5,6 +5,26 @@ to wherever you want.
 
 It leverages HTTP CONNECT to proxy traffic from the container to the host.
 
+## Patched images
+
+This fork publishes `ghcr.io/fitchmultz/proxy-everything` for Linux amd64 and arm64.
+It includes [Cloudflare PR #7](https://github.com/cloudflare/proxy-everything/pull/7),
+which supplies the existing DNS fallback for allowed hostnames when an upstream
+resolver is unavailable. Internet access and HTTP mapping authorization stay
+unchanged.
+
+The `Publish patched image` workflow tests Linux DNS sockets before publishing
+from `main`. Images use `sha-<full commit SHA>` tags and include GitHub build
+attestations. Consumers pin the registry digest, not a mutable tag. Miniflare
+accepts that image reference through `MINIFLARE_CONTAINER_EGRESS_IMAGE` or its
+`containerEngine.localDocker.containerEgressInterceptorImage` option.
+
+GitHub creates new packages as private. The package administrator sets this
+package to public after its first publication so consumers need no registry
+credentials. Verify anonymous pulls and both architectures before adopting a
+digest. Replace the fork image with Cloudflare's official image once its
+published fix passes the same backup and restore flow.
+
 # Why do I need this?
 This is very useful to do things like "listen to all IP ports that the container connects to".
 You can implement your own gateway for docker containers like this.
