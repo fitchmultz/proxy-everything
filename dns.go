@@ -19,7 +19,7 @@ import (
 
 const dnsBypassMark = 100
 const ipv6RecvOrigDstAddr = 74
-const dnsUpstreamTimeout = 5 * time.Second
+const dnsUpstreamTimeout = 2 * time.Second
 
 var dnsAllowedIPv4 = net.IPv4(11, 0, 0, 1).To4()
 var dnsAllowedIPv6 = net.ParseIP("fd00::1")
@@ -61,6 +61,11 @@ func dnsAllowedByPatterns(patterns []string, question dns.Question) bool {
 	}
 
 	return false
+}
+
+func isSandboxInternalHost(qname string) bool {
+	name := strings.ToLower(strings.TrimSuffix(qname, "."))
+	return name == "sandbox.internal" || strings.HasSuffix(name, ".sandbox.internal")
 }
 
 type dnsProxy struct {
@@ -145,8 +150,9 @@ func (p *dnsProxy) handlePacket(ctx context.Context, sourceAddr *net.UDPAddr, or
 	}
 
 	allowed := len(request.Question) > 0 && dnsAllowedByPatterns(p.config.DNSAllowPatterns(), request.Question[0])
+	bypassUpstream := allowed && len(request.Question) > 0 && isSandboxInternalHost(request.Question[0].Name)
 
-	if p.config.InternetEnabled() {
+	if p.config.InternetEnabled() && !bypassUpstream {
 		response, err := p.forwardToOriginal(ctx, originalDst, payload)
 		if err != nil {
 			log.Println("error dialing DNS:", err)

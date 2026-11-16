@@ -10,8 +10,11 @@ It leverages HTTP CONNECT to proxy traffic from the container to the host.
 This fork publishes `ghcr.io/fitchmultz/proxy-everything` for Linux amd64 and arm64.
 It includes [Cloudflare PR #7](https://github.com/cloudflare/proxy-everything/pull/7),
 which supplies the existing DNS fallback for allowed hostnames when an upstream
-resolver is unavailable. Internet access and HTTP mapping authorization stay
-unchanged.
+resolver is unavailable. Allowed `sandbox.internal` and `*.sandbox.internal`
+queries return the fallback answer directly without dialing upstream DNS, and
+upstream DNS calls time out after `2s` so silent UDP drops still fall back
+before 5s container resolver timeouts. Internet access and HTTP mapping
+authorization stay unchanged.
 
 The `Publish patched image` workflow tests Linux DNS sockets before publishing
 from `main`. Images use `sha-<full commit SHA>` tags and include GitHub build
@@ -208,9 +211,10 @@ UDP interception is currently limited to DNS on port `53` and is optional.
 
 Behavior:
 
-- If `internet.enabled=true`, intercepted DNS queries are forwarded to the original resolver and the upstream response is normally relayed unchanged.
+- If `internet.enabled=true`, intercepted DNS queries are normally forwarded to the original resolver (with a `2s` timeout) and the upstream response is relayed unchanged.
+- Queries for `sandbox.internal` and `*.sandbox.internal` that match `dns.allowHostnames` bypass upstream forwarding and receive the fallback answer directly.
 - If the upstream response is `NXDOMAIN` and the queried hostname matches `dns.allowHostnames`, the proxy synthesizes a fallback answer instead of returning `NXDOMAIN`.
-- If the upstream resolver is unavailable, matching hostnames also get a fallback answer. Non-matching queries remain unanswered.
+- If the upstream resolver is unavailable or times out after `2s`, matching hostnames also get a fallback answer. Non-matching queries remain unanswered.
 - If `internet.enabled=false`, the query is handled locally: matching hostnames get a fallback answer and non-matching hostnames get `NXDOMAIN`.
 - Fallback answers are currently `11.0.0.1` for `A` queries and `fd00::1` for `AAAA` queries.
 

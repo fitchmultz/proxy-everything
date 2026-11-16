@@ -11,6 +11,27 @@ import (
 	"github.com/miekg/dns"
 )
 
+func listenReusableUDP(t *testing.T) *net.UDPConn {
+	t.Helper()
+	listen := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
+		var socketError error
+		err := raw.Control(func(fd uintptr) {
+			socketError = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		})
+		return errors.Join(err, socketError)
+	}}
+	packetConn, err := listen.ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpConn, ok := packetConn.(*net.UDPConn)
+	if !ok {
+		packetConn.Close()
+		t.Fatalf("unexpected packet listener type %T", packetConn)
+	}
+	return udpConn
+}
+
 func TestDNSProxyRetainsUpstreamResponses(t *testing.T) {
 	for _, rcode := range []int{dns.RcodeSuccess, dns.RcodeServerFailure} {
 		t.Run(dns.RcodeToString[rcode], func(t *testing.T) {
@@ -19,22 +40,12 @@ func TestDNSProxyRetainsUpstreamResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer client.Close()
-			listen := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
-				var socketError error
-				err := raw.Control(func(fd uintptr) {
-					socketError = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-				})
-				return errors.Join(err, socketError)
-			}}
-			resolver, err := listen.ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
+			resolver := listenReusableUDP(t)
 			defer resolver.Close()
 			if err := resolver.SetReadDeadline(time.Now().Add(dnsUpstreamTimeout)); err != nil {
 				t.Fatal(err)
 			}
-			request := new(dns.Msg).SetQuestion("backups.sandbox.internal.", dns.TypeA)
+			request := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
 			payload, err := request.Pack()
 			if err != nil {
 				t.Fatal(err)
@@ -83,15 +94,33 @@ func TestDNSProxyRetainsUpstreamResponses(t *testing.T) {
 	}
 }
 
-func TestDNSProxyUnavailableResolver(t *testing.T) {
+func TestIsSandboxInternalHost(t *testing.T) {
+	for _, test := range []struct {
+		qname string
+		want  bool
+	}{
+		{"sandbox.internal", true},
+		{"sandbox.internal.", true},
+		{"backups.sandbox.internal.", true},
+		{"BACKUPS.SANDBOX.INTERNAL.", true},
+		{"notsandbox.internal.", false},
+		{"sandbox.internal.example.com.", false},
+		{"example.com.", false},
+		{"", false},
+	} {
+		if got := isSandboxInternalHost(test.qname); got != test.want {
+			t.Errorf("isSandboxInternalHost(%q) = %v, want %v", test.qname, got, test.want)
+		}
+	}
+}
+
+func TestDNSProxySandboxInternalSkipsUpstream(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		patterns []string
-		answer   bool
 	}{
-		{"intercepted hostname", []string{"backups.sandbox.internal"}, true},
-		{"wildcard mapping", []string{"*"}, true},
-		{"unmatched hostname", []string{"another.internal"}, false},
+		{"explicit pattern", []string{"backups.sandbox.internal"}},
+		{"wildcard mapping", []string{"*"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -99,13 +128,118 @@ func TestDNSProxyUnavailableResolver(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer client.Close()
-			resolver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+
+			resolver := listenReusableUDP(t)
+			defer resolver.Close()
+
+			config, err := newEgressConfiguration(80)
 			if err != nil {
 				t.Fatal(err)
 			}
-			resolverAddress := resolver.LocalAddr().(*net.UDPAddr)
-			if err := resolver.Close(); err != nil {
+			if err := config.SetDNSConfig(test.patterns); err != nil {
 				t.Fatal(err)
+			}
+
+			request := new(dns.Msg).SetQuestion("backups.sandbox.internal.", dns.TypeA)
+			payload, err := request.Pack()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			proxy := &dnsProxy{config: config}
+			start := time.Now()
+			proxy.handlePacket(t.Context(), client.LocalAddr().(*net.UDPAddr), resolver.LocalAddr().(*net.UDPAddr), payload)
+
+			if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			buffer := make([]byte, 512)
+			n, _, err := client.ReadFromUDP(buffer)
+			if err != nil {
+				t.Fatalf("sandbox.internal query received no fallback: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed >= dnsUpstreamTimeout {
+				t.Fatalf("sandbox.internal fallback waited for upstream timeout: elapsed=%v", elapsed)
+			}
+
+			response := new(dns.Msg)
+			if err := response.Unpack(buffer[:n]); err != nil {
+				t.Fatal(err)
+			}
+			if response.Id != request.Id || response.Rcode != dns.RcodeSuccess || len(response.Answer) != 1 {
+				t.Fatalf("unexpected fallback: %s", response)
+			}
+			answer, ok := response.Answer[0].(*dns.A)
+			if !ok || !answer.A.Equal(net.IPv4(11, 0, 0, 1)) {
+				t.Fatalf("unexpected fallback address: %s", response)
+			}
+
+			if err := resolver.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			upstreamBuffer := make([]byte, 512)
+			n, _, err = resolver.ReadFrom(upstreamBuffer)
+			var netErr net.Error
+			if !errors.As(err, &netErr) || !netErr.Timeout() {
+				t.Fatalf("expected upstream socket to receive zero packets (timeout), got n=%d err=%v", n, err)
+			}
+		})
+	}
+}
+
+func TestDNSProxyUnavailableResolver(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		qname     string
+		patterns  []string
+		answer    bool
+		blackhole bool
+	}{
+		{"intercepted hostname", "backups.sandbox.internal.", []string{"backups.sandbox.internal"}, true, false},
+		{"wildcard mapping", "backups.sandbox.internal.", []string{"*"}, true, false},
+		{"unmatched hostname", "backups.sandbox.internal.", []string{"another.internal"}, false, false},
+		{"silent drop upstream", "api.example.com.", []string{"*"}, true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			var resolverAddress *net.UDPAddr
+			var upstreamReceived chan struct{}
+			if test.blackhole {
+				resolver := listenReusableUDP(t)
+				resolverAddress = resolver.LocalAddr().(*net.UDPAddr)
+				drainDone := make(chan struct{})
+				upstreamReceived = make(chan struct{}, 1)
+				go func() {
+					defer close(drainDone)
+					drain := make([]byte, 512)
+					for {
+						if _, _, err := resolver.ReadFrom(drain); err != nil {
+							return
+						}
+						select {
+						case upstreamReceived <- struct{}{}:
+						default:
+						}
+					}
+				}()
+				defer func() {
+					_ = resolver.Close()
+					<-drainDone
+				}()
+			} else {
+				resolver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				resolverAddress = resolver.LocalAddr().(*net.UDPAddr)
+				if err := resolver.Close(); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			config, err := newEgressConfiguration(80)
@@ -115,12 +249,13 @@ func TestDNSProxyUnavailableResolver(t *testing.T) {
 			if err := config.SetDNSConfig(test.patterns); err != nil {
 				t.Fatal(err)
 			}
-			request := new(dns.Msg).SetQuestion("backups.sandbox.internal.", dns.TypeA)
+			request := new(dns.Msg).SetQuestion(test.qname, dns.TypeA)
 			payload, err := request.Pack()
 			if err != nil {
 				t.Fatal(err)
 			}
 			proxy := &dnsProxy{config: config}
+			start := time.Now()
 			proxy.handlePacket(t.Context(), client.LocalAddr().(*net.UDPAddr), resolverAddress, payload)
 
 			buffer := make([]byte, 512)
@@ -147,6 +282,16 @@ func TestDNSProxyUnavailableResolver(t *testing.T) {
 			n, _, err := client.ReadFromUDP(buffer)
 			if err != nil {
 				t.Fatalf("intercepted query received no fallback: %v", err)
+			}
+			if test.blackhole {
+				if elapsed := time.Since(start); elapsed >= 3*time.Second {
+					t.Fatalf("silent-drop fallback exceeded 3s budget: elapsed=%v", elapsed)
+				}
+				select {
+				case <-upstreamReceived:
+				case <-time.After(100 * time.Millisecond):
+					t.Fatal("blackhole upstream socket did not receive the forwarded query")
+				}
 			}
 			response := new(dns.Msg)
 			if err := response.Unpack(buffer[:n]); err != nil {
