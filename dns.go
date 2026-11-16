@@ -63,11 +63,6 @@ func dnsAllowedByPatterns(patterns []string, question dns.Question) bool {
 	return false
 }
 
-func isSandboxInternalHost(qname string) bool {
-	name := strings.ToLower(strings.TrimSuffix(qname, "."))
-	return name == "sandbox.internal" || strings.HasSuffix(name, ".sandbox.internal")
-}
-
 type dnsProxy struct {
 	addr   *net.UDPAddr
 	conn   *net.UDPConn
@@ -150,7 +145,7 @@ func (p *dnsProxy) handlePacket(ctx context.Context, sourceAddr *net.UDPAddr, or
 	}
 
 	allowed := len(request.Question) > 0 && dnsAllowedByPatterns(p.config.DNSAllowPatterns(), request.Question[0])
-	bypassUpstream := allowed && len(request.Question) > 0 && isSandboxInternalHost(request.Question[0].Name)
+	bypassUpstream := allowed && dns.IsSubDomain("sandbox.internal.", request.Question[0].Name)
 
 	if p.config.InternetEnabled() && !bypassUpstream {
 		response, err := p.forwardToOriginal(ctx, originalDst, payload)

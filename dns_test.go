@@ -94,26 +94,6 @@ func TestDNSProxyRetainsUpstreamResponses(t *testing.T) {
 	}
 }
 
-func TestIsSandboxInternalHost(t *testing.T) {
-	for _, test := range []struct {
-		qname string
-		want  bool
-	}{
-		{"sandbox.internal", true},
-		{"sandbox.internal.", true},
-		{"backups.sandbox.internal.", true},
-		{"BACKUPS.SANDBOX.INTERNAL.", true},
-		{"notsandbox.internal.", false},
-		{"sandbox.internal.example.com.", false},
-		{"example.com.", false},
-		{"", false},
-	} {
-		if got := isSandboxInternalHost(test.qname); got != test.want {
-			t.Errorf("isSandboxInternalHost(%q) = %v, want %v", test.qname, got, test.want)
-		}
-	}
-}
-
 func TestDNSProxySandboxInternalSkipsUpstream(t *testing.T) {
 	for _, test := range []struct {
 		name     string
